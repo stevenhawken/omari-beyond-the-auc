@@ -89,6 +89,7 @@ We split the development cohort 2/3 for training and 1/3 for testing, then fit:
   **overfitted** unpenalised regression fitted on only 200 infants
 
 ```{r fit}
+dir.create("output", showWarnings = FALSE)   # model cache (not stored in the repository)
 if (file.exists("output/fit.rds")) {
   res <- readRDS("output/fit.rds")
 } else {
