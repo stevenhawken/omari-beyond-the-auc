@@ -1,0 +1,476 @@
+---
+title: "Beyond the AUC, part 2: the real data"
+subtitle: "External validation of the Ontario gestational age model in Bangladesh and Zambia"
+author: "Steven Hawken"
+date: 2026-10-28
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    embed-resources: true
+    code-tools: true
+    theme: cosmo
+    fig-width: 9
+    fig-height: 4.5
+    df-print: kable
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+::: {.callout-note}
+## About these data
+The Zambia and Bangladesh newborn screening data are **openly available** on
+Dryad ([doi:10.5061/dryad.m37pvmd6b](https://doi.org/10.5061/dryad.m37pvmd6b)).
+The reference GA is from a first-trimester dating ultrasound. The Ontario
+development data cannot be shared, but the **fitted Ontario models** are used
+here exactly as they were for the published external validations. Minor
+differences from published numbers are expected because missing analytes are
+handled more simply here: batch-mean imputation instead of multiple imputation.
+:::
+
+# Setup
+
+```{r setup}
+# install.packages(c("dplyr", "tidyr", "forcats", "ggplot2", "glmnet", "glmnetUtils"))
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(glmnetUtils)
+library(splines)
+
+source("code/ga_functions.R")   # original pipeline (prep.data, pareto_log, ...)
+source("code/gavars.R")         # original derived variables (af_ratio, SGA, ...)
+source("code/ga_preprocess.R")  # frozen preprocessing (section 4)
+source("R/metrics.R")           # AUC with DeLong CI, etc.
+source("R/plots.R")             # theme and palette
+source("R/real_data.R")         # loading and scoring helpers
+
+options(width = 200)
+pct <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+
+full_model <- readRDS("code/full_model_pto_relax.rds")  # Ontario: clinical + analytes
+bw_model   <- readRDS("code/bw_model_pto_relax.rds")    # Ontario: birthweight, sex, multiple
+cohorts    <- load_all_cohorts("data")
+```
+
+# Meet the data
+
+## Four cohorts, two countries, two sample types
+
+```{r cohort-table}
+bind_rows(cohorts) |>
+  group_by(Cohort = cohort) |>
+  summarise(n = n(),
+            `Preterm (<37 wk)` = sprintf("%d (%s)", sum(preterm01), pct(mean(preterm01))),
+            `<34 wk` = sum(gestage < 34),
+            `SGA (<10th)` = pct(mean(sga10 == 1)),
+            `Median birthweight (g)` = median(bweight_raw),
+            Multiples = sum(multiple == "multiple"),
+            .groups = "drop") |>
+  arrange(match(Cohort, COHORTS$cohort))
+```
+
+Preterm infants are **rare** in every cohort: 11 in Zambia heel samples, 35
+in Bangladesh heel samples. Keep that in mind when you see the confidence
+intervals below.
+
+## Birthweight for gestational age differs between the two countries
+
+```{r bw-ga, fig.height=4.2}
+heel <- bind_rows(cohorts[c("Bangladesh heel", "Zambia heel")])
+ggplot(heel, aes(gestage, bweight_raw, colour = country)) +
+  geom_point(alpha = 0.35, size = 1.2) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1, formula = y ~ x) +
+  scale_colour_manual(values = COL_COUNTRY) +
+  labs(x = "Reference GA (weeks)", y = "Birthweight (g)",
+       title = "Bangladeshi infants are lighter at every gestational age",
+       subtitle = "Heel-prick cohorts; lines are loess smoothers") +
+  theme_seminar()
+```
+
+About 1 in 4 Bangladeshi infants is small for gestational age, against about
+1 in 12 in Zambia. A model that leans on birthweight will
+**underestimate GA** wherever growth restriction is common.
+
+## Which analytes track gestational age?
+
+```{r correlations, fig.height=5.5}
+num_vars <- c("bweight_raw", "af_ratio", LOG_VARS)
+cors <- bind_rows(lapply(names(cohorts), function(k) {
+  d <- cohorts[[k]]
+  data.frame(cohort = k, variable = num_vars,
+             rho = sapply(num_vars, function(v)
+               cor(d[[v]], d$gestage, method = "spearman", use = "complete.obs")))
+}))
+top <- cors |> group_by(variable) |> summarise(m = mean(abs(rho))) |>
+  slice_max(m, n = 15) |> pull(variable)
+cors |>
+  filter(variable %in% top) |>
+  mutate(variable = factor(variable, levels = rev(top)),
+         variable = forcats::fct_recode(variable, Birthweight = "bweight_raw",
+                                        `Adult/fetal Hb ratio` = "af_ratio"),
+         country = sub(" .*", "", cohort), sample = sub(".* ", "", cohort)) |>
+  ggplot(aes(rho, variable, colour = country, shape = sample)) +
+  geom_vline(xintercept = 0, colour = INK2) +
+  geom_point(size = 2.6) +
+  scale_colour_manual(values = COL_COUNTRY) +
+  scale_shape_manual(values = c(heel = 16, cord = 1)) +
+  labs(x = "Spearman correlation with reference GA", y = NULL,
+       title = "Haemoglobin ratio and birthweight carry most of the signal") +
+  theme_seminar()
+```
+
+Only the adult/fetal haemoglobin ratio and birthweight correlate with GA
+beyond |ρ| ≈ 0.3. The rest of the model's accuracy comes from combining many
+weak signals, which is why it uses penalised regression.
+
+## Heel and cord blood are different samples
+
+The same infants often gave both a heel-prick and a cord-blood sample, so we
+can compare the two directly:
+
+```{r heel-cord, fig.height=4.5}
+pairs_bd <- inner_join(
+  cohorts[["Bangladesh heel"]] |> select(pair_id, gestage, N_17OHP, TSH, TYR, af_ratio),
+  cohorts[["Bangladesh cord"]] |> select(pair_id, N_17OHP, TSH, TYR, af_ratio),
+  by = "pair_id", suffix = c("_heel", "_cord"))
+pairs_long <- bind_rows(lapply(c("N_17OHP", "TSH", "TYR", "af_ratio"), function(v)
+  data.frame(analyte = v, heel = pairs_bd[[paste0(v, "_heel")]],
+             cord = pairs_bd[[paste0(v, "_cord")]])))
+pairs_long |>
+  filter(heel > 0, cord > 0) |>
+  ggplot(aes(heel, cord)) +
+  geom_abline(colour = INK2, linetype = "dashed") +
+  geom_point(alpha = 0.3, size = 1, colour = COL_COUNTRY[["Bangladesh"]]) +
+  scale_x_log10() + scale_y_log10() +
+  facet_wrap(~ analyte, scales = "free", nrow = 1) +
+  labs(x = "Heel prick", y = "Cord blood",
+       title = sprintf("Same %d Bangladeshi infants, two sample types", nrow(pairs_bd)),
+       subtitle = "Dashed line = equal values (log scales)") +
+  theme_seminar()
+```
+
+17-OHP is about five times higher in cord blood, while TSH and tyrosine are
+lower. A model trained on heel-prick samples sees cord blood as a
+**shifted population**, even for the very same infant.
+
+## Laboratory and population differences between countries
+
+```{r hb, fig.height=3.8}
+heel |>
+  select(country, `Raw HbF (% of peak)` = HGB_F, `Adult/fetal Hb ratio` = af_ratio) |>
+  pivot_longer(-country) |>
+  mutate(name = factor(name, levels = c("Raw HbF (% of peak)", "Adult/fetal Hb ratio"))) |>
+  ggplot(aes(value, fill = country)) +
+  geom_density(alpha = 0.5, colour = NA) +
+  facet_wrap(~ name, scales = "free") +
+  scale_fill_manual(values = COL_COUNTRY) +
+  labs(x = NULL, y = "Density",
+       title = "Raw HbF differs between the countries; the ratio barely does") +
+  theme_seminar()
+```
+
+A **ratio** of two measurements from the same run cancels much of the
+between-laboratory calibration difference. Feature choices affect
+transportability.
+
+## Data quality
+
+```{r missing}
+bind_rows(lapply(names(cohorts), function(k) {
+  d <- cohorts[[k]]
+  data.frame(cohort = k, variable = c("af_ratio", LOG_VARS),
+             missing = sapply(c("af_ratio", LOG_VARS), function(v) mean(is.na(d[[v]]))))
+})) |>
+  filter(missing > 0.05) |>
+  mutate(missing = pct(missing)) |>
+  pivot_wider(names_from = cohort, values_from = missing, values_fill = "<5%")
+
+sapply(cohorts, function(d) sum(d$TSH <= 0, na.rm = TRUE))   # non-positive TSH values
+```
+
+Zambia has substantial missingness for several analytes, and some TSH values
+are ≤ 0 (below the detection limit). External data are rarely as clean as the
+development data.
+
+# External validation of the Ontario model
+
+Both Ontario models are applied exactly as in the published validations.
+Each cohort is standardised on itself before scoring (see section 4).
+
+```{r score}
+for (k in names(cohorts)) {
+  cohorts[[k]]$pred_full <- score_site_standardised(cohorts[[k]], full_model, alpha = 0.75)
+  cohorts[[k]]$pred_bw   <- score_site_standardised(cohorts[[k]], bw_model)
+}
+```
+
+## Accuracy, with bootstrap confidence intervals
+
+```{r perf}
+perf_tab <- bind_rows(lapply(names(cohorts), function(k) {
+  d <- cohorts[[k]]
+  bind_rows(lapply(c(`Clinical + analytes` = "pred_full",
+                     `Birthweight, sex, multiple` = "pred_bw"), function(v) {
+    b <- boot_perf(d$gestage, d[[v]], B = 1000)
+    g <- function(m) b[b$metric == m, ]
+    data.frame(
+      Cohort = k, n = nrow(d),
+      `MAE (wk)` = with(g("MAE"), fmt_ci(estimate, lower, upper)),
+      `Within 7 days` = with(g("within_7d"), fmt_ci(estimate, lower, upper, d = 0, pct = TRUE)),
+      `Bias (wk)` = with(g("bias"), fmt_ci(estimate, lower, upper)),
+      `MAE preterm` = with(g("MAE_preterm"), fmt_ci(estimate, lower, upper)),
+      check.names = FALSE)
+  }), .id = "Model")
+}))
+perf_tab |> relocate(Cohort, Model)
+```
+
+* Heel-prick MAE is about 0.8 weeks in both countries, close to the 0.7 weeks
+  in the Ontario test set. Cord blood is worse.
+* The confidence intervals for **preterm infants** are wide: 11–35 preterm
+  infants per heel cohort is not enough to pin down subgroup accuracy.
+
+## Calibration and regression to the mean
+
+```{r cal-real, fig.height=6.5}
+all_scored <- bind_rows(cohorts) |>
+  mutate(cohort = factor(cohort, levels = COHORTS$cohort))
+ggplot(all_scored, aes(pred_full, gestage)) +
+  geom_abline(colour = INK2, linetype = "dashed") +
+  geom_point(aes(colour = country), alpha = 0.3, size = 1, show.legend = FALSE) +
+  geom_smooth(method = "loess", se = FALSE, colour = INK, linewidth = 0.9,
+              formula = y ~ x) +
+  facet_wrap(~ cohort, nrow = 2) +
+  scale_colour_manual(values = COL_COUNTRY) +
+  coord_equal(xlim = c(27, 43), ylim = c(27, 43)) +
+  labs(x = "Predicted GA (weeks)", y = "Reference GA (weeks)",
+       title = "Reference vs predicted GA, Ontario full model") +
+  theme_seminar()
+```
+
+```{r rtm-real, fig.height=4.2}
+plot_regression_to_mean(rename(cohorts[["Bangladesh cord"]], ga_ref = gestage),
+                        pred = "pred_full") +
+  labs(title = "Bangladesh cord: errors against reference vs predicted GA")
+```
+
+This is the same pattern as in the simulation: infants **born** preterm are
+predicted too old (left), because of regression to the mean.
+
+## Where the analytes earn their keep: small-for-gestational-age infants
+
+```{r sga}
+bind_rows(cohorts) |>
+  mutate(group = ifelse(sga10 == 1, "SGA (<10th centile)", "Not SGA")) |>
+  group_by(Cohort = cohort, group) |>
+  summarise(n = n(),
+            `Bias, birthweight model` = mean(pred_bw - gestage),
+            `Bias, full model` = mean(pred_full - gestage),
+            `MAE, birthweight model` = mean(abs(pred_bw - gestage)),
+            `MAE, full model` = mean(abs(pred_full - gestage)), .groups = "drop") |>
+  mutate(across(where(is.double), \(x) round(x, 2))) |>
+  arrange(match(Cohort, COHORTS$cohort), desc(group))
+```
+
+The birthweight model reads growth restriction as immaturity: it
+underestimates GA in SGA infants by 1.5–3.3 weeks. The metabolic profile
+largely corrects this. That matters most in settings where SGA is common.
+
+## Heel vs cord in the same infants
+
+```{r paired-perf}
+paired_perf <- function(country) {
+  h <- cohorts[[paste(country, "heel")]]; c <- cohorts[[paste(country, "cord")]]
+  j <- inner_join(select(h, pair_id, gestage, heel = pred_full),
+                  select(c, pair_id, cord = pred_full), by = "pair_id")
+  data.frame(Country = country, `Paired infants` = nrow(j),
+             `MAE heel` = mean(abs(j$heel - j$gestage)),
+             `MAE cord` = mean(abs(j$cord - j$gestage)),
+             `Within 7 d, heel` = pct(mean(abs(j$heel - j$gestage) <= 1)),
+             `Within 7 d, cord` = pct(mean(abs(j$cord - j$gestage) <= 1)),
+             check.names = FALSE)
+}
+bind_rows(paired_perf("Bangladesh"), paired_perf("Zambia")) |>
+  mutate(across(where(is.double), \(x) round(x, 2)))
+```
+
+Same infants, same reference GA: the difference is due to the **sample type**
+alone. That is a measurement shift, not a population shift.
+
+## Discrimination for preterm birth
+
+Predicted GA itself is the score: the lower the predicted GA, the more likely
+preterm.
+
+```{r auc-real}
+bind_rows(lapply(names(cohorts), function(k) {
+  d <- cohorts[[k]]
+  a3 <- auc_ci(d$preterm01, -d$pred_full); a1 <- auc_ci(d$preterm01, -d$pred_bw)
+  data.frame(Cohort = k, `Preterm infants` = sum(d$preterm01),
+             `AUC, full model` = fmt_ci(a3[1], a3[2], a3[3], 3),
+             `AUC, birthweight model` = fmt_ci(a1[1], a1[2], a1[3], 3),
+             check.names = FALSE)
+}))
+```
+
+AUCs are high for the full model everywhere. With so few preterm infants,
+though, the estimates are imprecise: the birthweight model's interval in Zambia
+heel samples runs from about 0.64 to 0.99, and asymptotic intervals such as
+DeLong's are themselves unreliable with 11 events. Current guidance for
+external validation studies is to plan sample size around the **number of
+events** (often 100 or more) and the precision needed for calibration as well
+as discrimination (Riley et al., *BMJ* 2024).
+
+## Counting preterm births: a surveillance use case
+
+```{r prevalence}
+bind_rows(lapply(names(cohorts), function(k) {
+  d <- cohorts[[k]]
+  data.frame(Cohort = k, `Observed preterm` = pct(mean(d$preterm01)),
+             `Predicted GA < 37 wk` = pct(mean(d$pred_full < 37)),
+             check.names = FALSE)
+}))
+```
+
+Counting infants whose **predicted** GA is below 37 weeks underestimates the
+preterm birth rate, sometimes by half. This is regression to the mean again:
+predictions are pulled toward term. For population surveillance, estimate the
+rate by averaging calibrated predicted probabilities, not by counting
+classifications.
+
+# Does a prediction depend on the batch it is scored in?
+
+The published pipeline standardises each dataset **on itself** before scoring
+(`prep.data()`), and the model's spline knots are written as
+`knots = quantile(x, ...)`, which is re-evaluated on whatever data are being
+scored. So an infant's prediction can depend on **who else is in the batch**.
+
+## The same infants, scored in different batches
+
+```{r batch, fig.height=4.2}
+bh <- cohorts[["Bangladesh heel"]]
+set.seed(11); idx_random <- sample(nrow(bh), 60)
+set.seed(12); idx_enriched <- c(sample(which(bh$preterm01 == 1), 30),
+                                sample(which(bh$preterm01 == 0), 30))
+batch_df <- bind_rows(
+  data.frame(batch = "Random batch of 60",
+             full_cohort = bh$pred_full[idx_random],
+             own_batch = score_site_standardised(bh[idx_random, ], full_model, 0.75)),
+  data.frame(batch = "Batch of 60, half preterm",
+             full_cohort = bh$pred_full[idx_enriched],
+             own_batch = score_site_standardised(bh[idx_enriched, ], full_model, 0.75)))
+batch_df |>
+  group_by(batch) |>
+  summarise(`Mean shift (wk)` = mean(own_batch - full_cohort),
+            `Mean |change| (wk)` = mean(abs(own_batch - full_cohort)),
+            `Largest |change| (wk)` = max(abs(own_batch - full_cohort))) |>
+  mutate(across(where(is.double), \(x) round(x, 2)))
+
+ggplot(batch_df, aes(full_cohort, own_batch)) +
+  geom_abline(colour = INK2, linetype = "dashed") +
+  geom_point(colour = COL_COUNTRY[["Bangladesh"]], alpha = 0.7) +
+  facet_wrap(~ batch) + coord_equal() +
+  labs(x = "Predicted GA, scored within the full cohort",
+       y = "Predicted GA, scored as its own batch",
+       title = "Same infants, same model, different answers") +
+  theme_seminar()
+```
+
+In a batch that is half preterm, standardisation re-centres the batch, and
+every prediction is pulled **toward term**. A single infant cannot be scored at
+all. The published cohort-level results are not wrong, but the validated
+"model" includes a site-level re-standardisation step. That step:
+
+* can absorb laboratory calibration differences (helpful);
+* assumes the new population's GA and birthweight mix resembles Ontario's
+  (risky where preterm birth or SGA is common);
+* needs a representative batch, so it cannot score infants one at a time.
+
+## The fix: learn every constant once, in the reference data
+
+`code/ga_preprocess.R` stores the floor, winsorisation cap, centre, scale and
+spline knots from the reference data, and applies them unchanged. Until the
+Ontario constants are available, the **Bangladesh heel cohort stands in as the
+reference** to demonstrate the mechanics:
+
+```{r frozen}
+ref_raw <- cohorts[["Bangladesh heel"]]
+prep_ref <- ga_prep_fit(ref_raw, LOG_VARS, NOLOG_VARS,
+                        reference_label = "Bangladesh heel (stand-in)")
+set.seed(1); ref_pto <- prep.data(ref_raw)
+fit_rows <- complete.cases(ref_pto[, c(LOG_VARS, NOLOG_VARS)])
+knots_ref <- ga_knots_fit(ref_pto[fit_rows, ], SPLINE_VARS, type = "bs_range")
+bundle_ref <- ga_bundle(ga_freeze_terms(full_model, knots_ref), prep_ref,
+                        knots_ref, alpha = 0.75)
+check_batch_invariance(bundle_ref, cohorts[["Zambia heel"]], n = 40)
+```
+
+The frozen constants also give a **covariate-shift table**: how far each
+variable in a new cohort is from the reference, in reference SD units. Look
+at it before looking at outcomes.
+
+```{r shift}
+shift_top <- function(target, label) {
+  ga_shift(ga_prep_apply(cohorts[[target]], prep_ref)) |>
+    head(6) |>
+    transmute(Comparison = label, variable,
+              `SMD vs reference` = round(smd_vs_reference, 2),
+              `% outside reference range` = pct(pct_below_ref + pct_above_ref))
+}
+bind_rows(shift_top("Zambia heel", "Zambia heel (other site)"),
+          shift_top("Bangladesh cord", "Bangladesh cord (other sample type)"))
+```
+
+```{r ontario-frozen, eval = file.exists("code/full_model_frozen_bundle.rds")}
+# Runs once the Ontario constants have been released from ICES
+ont_bundle <- readRDS("code/full_model_frozen_bundle.rds")
+bind_rows(lapply(names(cohorts), function(k) {
+  d <- cohorts[[k]]
+  p <- predict_ga(ont_bundle, d, impute = "reference_mean")
+  data.frame(Cohort = k,
+             `MAE, site-standardised` = mean(abs(d$pred_full - d$gestage)),
+             `MAE, Ontario-frozen` = mean(abs(p - d$gestage)),
+             `Bias, site-standardised` = mean(d$pred_full - d$gestage),
+             `Bias, Ontario-frozen` = mean(p - d$gestage), check.names = FALSE)
+})) |>
+  mutate(across(where(is.double), \(x) round(x, 2)))
+```
+
+# What we would do differently next time
+
+::: {.callout-tip}
+## Lessons from this case study
+1. **The model is the whole pipeline.** Learn every preprocessing constant
+   in the training data only, store it with the coefficients, and test that
+   predictions do not depend on the batch.
+2. **Store spline knots as numbers**, and prefer restricted (natural) cubic
+   splines, which are linear beyond the outer knots, for models that will
+   travel. B-splines extrapolate as unconstrained cubics.
+3. **Look at covariate shift before outcomes**: sample type, laboratory,
+   population.
+4. **If you standardise per site, do it on purpose.** Describe it as part of
+   the model and test its sensitivity to batch composition.
+5. **Plan external validation sample sizes around events**, not
+   participants.
+6. **Justify class-imbalance weights**, and report calibration.
+7. **Report the model as coded**, following TRIPOD+AI.
+:::
+
+# References
+
+* Hawken S, et al. Development and external validation of machine learning
+  algorithms for postnatal gestational age estimation using clinical data and
+  metabolomic markers. *PLOS ONE* 2023. Data: Dryad,
+  doi:10.5061/dryad.m37pvmd6b.
+* Riley RD, Archer L, Snell KIE, et al. Evaluation of clinical prediction
+  models (part 3): calculating the sample size required for an external
+  validation study. *BMJ* 2024.
+* Collins GS, et al. TRIPOD+AI statement. *BMJ* 2024.
+
+```{r session}
+sessionInfo()
+```

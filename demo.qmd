@@ -1,0 +1,724 @@
+---
+title: "Beyond the AUC: evaluating a clinical prediction model in R"
+subtitle: "OMARI Seminar Series · companion code and live demo"
+author: "Steven Hawken"
+date: 2026-10-28
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    embed-resources: true
+    code-tools: true
+    theme: cosmo
+    fig-width: 9
+    fig-height: 4.5
+    df-print: kable
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+::: {.callout-warning}
+## These are simulated data
+Every number in this document comes from **simulated** data. The design
+(clinical covariates plus ~30 newborn screening analytes, a large development
+cohort and two smaller external sites) is loosely inspired by published work on
+estimating gestational age (GA) from newborn screening. The relationships and
+parameter values are invented, so the results here **do not reproduce** any
+published study. For the real results, see the references at the end.
+:::
+
+# Setup
+
+```{r setup}
+# install.packages(c("dplyr", "ggplot2", "glmnet", "ranger"))
+library(dplyr)
+library(ggplot2)
+library(glmnet)
+library(splines)
+
+source("R/simulate_data.R")   # data-generating mechanism
+source("R/fit_models.R")      # feature construction + model fitting
+source("R/metrics.R")         # performance measures, written out in base R
+source("R/plots.R")           # shared ggplot helpers
+
+options(width = 200)
+pct <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+```
+
+## The data
+
+Three cohorts. Because the data are simulated, each infant has both a
+**true GA** and a **reference GA**: the value a dating ultrasound would record,
+which includes measurement error. Real studies only ever see the reference.
+
+```{r data}
+if (!file.exists("data/sim_dev.csv")) simulate_all("data")
+dev   <- read.csv("data/sim_dev.csv")
+siteA <- read.csv("data/sim_siteA.csv")
+siteB <- read.csv("data/sim_siteB.csv")
+
+bind_rows(dev, siteA, siteB) |>
+  group_by(site) |>
+  summarise(n = n(),
+            `Preterm (reference)` = pct(mean(preterm)),
+            `Preterm (true)` = pct(mean(preterm_true)),
+            `SGA` = pct(mean(sga)),
+            `Mean birthweight (g)` = round(mean(bw)),
+            `Dating US at 9-13 wk` = pct(mean(us_timing == "9-13 wk"), 0))
+```
+
+What differs between the sites (by design):
+
+| | Development | External site A | External site B |
+|---|---|---|---|
+| Population | Reference population | Smaller for GA (more SGA), more preterm | Smaller for GA, more preterm |
+| Laboratory | Reference lab | Different calibration for 6 analytes | Different calibration for 5 analytes |
+| Reference standard | First-trimester ultrasound | First-trimester ultrasound | **Mostly 2nd/3rd-trimester ultrasound** |
+
+# The case model, in brief
+
+We split the development cohort 2/3 for training and 1/3 for testing, then fit:
+
+* **Clinical only:** sex, multiple birth, birthweight (natural spline), fitted by OLS
+* **Full:** clinical + 30 log-analytes + their squares + age at collection, fitted by
+  elastic net (α = 0.5, λ chosen by 10-fold cross-validation)
+* two comparators used later: a **random forest** and a deliberately
+  **overfitted** unpenalised regression fitted on only 200 infants
+
+```{r fit}
+if (file.exists("output/fit.rds")) {
+  res <- readRDS("output/fit.rds")
+} else {
+  res <- fit_all(dev, siteA, siteB)
+  saveRDS(res, "output/fit.rds")
+}
+m3 <- res$models$m3
+cat("Non-zero coefficients in the full model:",
+    sum(coef(m3, s = "lambda.min") != 0) - 1, "of", nrow(coef(m3)) - 1, "\n")
+```
+
+The evaluation below uses only four columns: the reference GA (`ga_ref`), the
+predictions (`pred_*`), and a preterm indicator. **Everything that follows could
+be done for any model, however it was built.**
+
+# Performance for a continuous outcome
+
+## Overall accuracy
+
+```{r cont-metrics}
+sites <- c(test = "Development (test)", siteA = "External site A",
+           siteB = "External site B")
+
+cont_tab <- bind_rows(lapply(names(sites), function(s) {
+  d <- res[[s]]
+  bind_rows(
+    cbind(site = sites[[s]], model = "Clinical only",
+          cont_metrics(d$ga_ref, d$pred_m1)),
+    cbind(site = sites[[s]], model = "Full",
+          cont_metrics(d$ga_ref, d$pred_m3)))
+}))
+
+cont_tab |>
+  mutate(across(c(bias_wk, MAE_wk, RMSE_wk, R2, cal_slope), \(x) round(x, 2)),
+         across(c(within_7d, within_14d), pct)) |>
+  select(site, model, n, bias_wk, MAE_wk, RMSE_wk, R2, within_7d, within_14d,
+         cal_slope)
+```
+
+**Reading the table**
+
+* **MAE** is the typical error in weeks: 0.7 weeks is about ±5 days.
+* **Bias** (mean predicted − reference) is *calibration-in-the-large* for a
+  continuous outcome. At site A the model **underestimates** GA on average.
+* **% within 7/14 days** is often the most meaningful number for clinicians.
+* The **calibration slope** (regressing reference on predicted) is close to 1
+  everywhere: predictions are not systematically too extreme or too moderate.
+
+## Calibration: observed against predicted
+
+```{r cont-cal, fig.height=4.2}
+long <- stack_sites(res)
+plot_cont_calibration(long) +
+  labs(title = "Reference vs predicted GA, full model",
+       subtitle = "Dashed = perfect agreement; black = loess smoother")
+```
+
+## "The model overestimates GA in preterm infants". Is it miscalibrated?
+
+This pattern appears in almost every GA-dating paper. Look at the errors in
+two different ways:
+
+```{r rtm, fig.height=4.2}
+plot_regression_to_mean(res$test) +
+  labs(title = "Same predictions, same errors, two different questions")
+```
+
+* **Left:** among infants who *were* born at 30 weeks, the predictions are too
+  high on average. That is **regression to the mean**, and any model with
+  R² < 1 shows it.
+* **Right:** among infants *predicted* to be 30 weeks, the average error is
+  much closer to 0. **The model is broadly calibrated.** A small misfit
+  remains in the sparse preterm range; we return to it in the section on
+  class imbalance.
+
+Calibration is judged conditional on the **prediction**, because that is what
+is available when the model is used. Subgroup analyses by true outcome status
+(such as "preterm infants") answer a different question. It is a legitimate
+one, but it is not calibration.
+
+```{r subgroups}
+subgroup_tab <- function(d, label) {
+  d |>
+    mutate(group = case_when(preterm == 1 ~ "Preterm (<37 wk)",
+                             sga == 1 ~ "Term, SGA",
+                             TRUE ~ "Term, not SGA")) |>
+    group_by(group) |>
+    summarise(n = n(),
+              `MAE clinical` = mean(abs(pred_m1 - ga_ref)),
+              `MAE full` = mean(abs(pred_m3 - ga_ref)),
+              `Bias full` = mean(pred_m3 - ga_ref), .groups = "drop") |>
+    mutate(site = label, .before = 1)
+}
+bind_rows(subgroup_tab(res$test, "Development (test)"),
+          subgroup_tab(res$siteA, "External site A")) |>
+  mutate(across(where(is.double), \(x) round(x, 2)))
+```
+
+Among SGA infants, birthweight is misleading and the clinical-only model does
+badly. The analytes carry information about maturity that does not depend on
+size.
+
+## When the reference standard is the problem
+
+Site B looks much worse than site A. But because the data are simulated, we
+can also score the predictions against the **true** GA:
+
+```{r ref-standard}
+res$siteB |>
+  group_by(`Dating ultrasound` = us_timing) |>
+  summarise(n = n(),
+            `MAE vs reference` = mean(abs(pred_m3 - ga_ref)),
+            `MAE vs TRUE GA` = mean(abs(pred_m3 - ga_true))) |>
+  bind_rows(res$siteB |>
+              summarise(`Dating ultrasound` = "All", n = n(),
+                        `MAE vs reference` = mean(abs(pred_m3 - ga_ref)),
+                        `MAE vs TRUE GA` = mean(abs(pred_m3 - ga_true)))) |>
+  mutate(across(where(is.double), \(x) round(x, 2)))
+```
+
+Against the truth the model is as accurate at site B as anywhere else. Most of
+the apparent loss of accuracy comes from a **noisier reference standard**
+(late ultrasounds), not from the model. In real data you never see the right
+column, so check it indirectly: restrict to infants with the best-quality
+reference, as in the Kenya validation.
+
+# Discrimination
+
+## From predicted GA to a risk of preterm birth
+
+Net benefit and most classification metrics need a **predicted probability**.
+We map predicted GA to P(preterm) with a logistic model fitted in the
+**training** data only:
+
+```{r link}
+link <- glm(preterm ~ pred_m3, family = binomial, data = res$train)
+link1 <- glm(preterm ~ pred_m1, family = binomial, data = res$train)
+for (s in c("test", "siteA", "siteB")) {
+  res[[s]]$p_m3 <- predict(link,  newdata = res[[s]], type = "response")
+  res[[s]]$p_m1 <- predict(link1, newdata = res[[s]], type = "response")
+}
+```
+
+## The AUC (c-statistic)
+
+The AUC is the probability that a randomly chosen preterm infant gets a higher
+predicted risk than a randomly chosen term infant. It depends only on the
+**ranking** of the predictions.
+
+```{r auc}
+auc_row <- function(site, model, y, p) {
+  ci <- auc_ci(y, p)
+  data.frame(site = site, model = model, AUC = ci[["AUC"]],
+             lower = ci[["lower"]], upper = ci[["upper"]])
+}
+bind_rows(lapply(names(sites), function(s) {
+  d <- res[[s]]
+  bind_rows(auc_row(sites[[s]], "Clinical only", d$preterm, d$p_m1),
+            auc_row(sites[[s]], "Full", d$preterm, d$p_m3))
+})) |>
+  mutate(across(where(is.double), \(x) round(x, 3)))
+```
+
+```{r roc, fig.height=4.5}
+roc_long <- bind_rows(lapply(names(sites), function(s) {
+  cbind(roc_df(res[[s]]$preterm, res[[s]]$p_m3),
+        site_lab = factor(sites[[s]], levels = sites))
+}))
+plot_roc(roc_long, "site_lab", COL_SITE, zoom = TRUE) +
+  labs(title = "ROC curves, full model (zoomed to the top-left corner)")
+```
+
+Look at site B's AUC. The same predictions scored against the **true** preterm
+status give:
+
+```{r auc-true}
+round(auc_ci(res$siteB$preterm_true, res$siteB$p_m3), 3)
+```
+
+Misclassification in the reference standard **drags the AUC down**, even when
+the model is unchanged.
+
+## Thresholds, prevalence and the accuracy trap
+
+```{r thresholds}
+bind_rows(lapply(names(sites), function(s) {
+  d <- res[[s]]
+  bind_rows(cbind(site = sites[[s]], class_metrics(d$preterm, d$p_m3, 0.5)),
+            cbind(site = sites[[s]], class_metrics(d$preterm, d$p_m3, 0.2)))
+})) |>
+  mutate(across(prevalence:accuracy, pct))
+```
+
+* **Sensitivity and specificity** describe the test. **PPV and NPV** describe
+  the patient in front of you, and they change with prevalence. The sites
+  differ in calibration as well as prevalence, so to isolate the effect of
+  prevalence, hold the development-set sensitivity and specificity (threshold
+  0.2) fixed:
+
+```{r ppv-prev}
+cm <- class_metrics(res$test$preterm, res$test$p_m3, 0.2)
+data.frame(prevalence = c(0.02, 0.05, 0.084, 0.15, 0.25)) |>
+  mutate(PPV = cm$sensitivity * prevalence /
+           (cm$sensitivity * prevalence + (1 - cm$specificity) * (1 - prevalence)),
+         NPV = cm$specificity * (1 - prevalence) /
+           (cm$specificity * (1 - prevalence) + (1 - cm$sensitivity) * prevalence),
+         across(everything(), pct))
+```
+
+* A "model" that calls **every** infant term has an accuracy of
+  `r pct(1 - mean(res$test$preterm))` in the development test set. **Accuracy is
+  not a useful summary when outcomes are imbalanced.**
+
+## Overall accuracy of the probabilities: the Brier score
+
+```{r brier}
+bind_rows(lapply(names(sites), function(s) {
+  d <- res[[s]]
+  bind_rows(cbind(site = sites[[s]], model = "Clinical only",
+                  bin_metrics(d$preterm, d$p_m1)),
+            cbind(site = sites[[s]], model = "Full",
+                  bin_metrics(d$preterm, d$p_m3)))
+})) |>
+  select(site, model, prevalence, Brier, scaled_Brier) |>
+  mutate(across(where(is.double), \(x) round(x, 3)))
+```
+
+The raw Brier score depends on prevalence, so it cannot be compared across
+sites. The **scaled Brier** (1 − Brier / Brier of a model that always predicts
+the prevalence) is easier to interpret.
+
+# Calibration
+
+## The calibration hierarchy
+
+| Level | Question | Measure |
+|---|---|---|
+| Mean | Is the average predicted risk right? | O/E ratio, calibration-in-the-large (CITL) |
+| Weak | Are predictions too extreme or too moderate? | Calibration slope |
+| Moderate | Is predicted risk right across its whole range? | Flexible calibration curve |
+
+```{r bin-cal}
+cal_tab <- bind_rows(lapply(names(sites), function(s) {
+  d <- res[[s]]
+  cbind(site = sites[[s]], bin_metrics(d$preterm, d$p_m3))
+}))
+cal_tab |>
+  select(site, prevalence, mean_pred, O_E, CITL, cal_slope, AUC) |>
+  mutate(across(where(is.double), \(x) round(x, 3)))
+```
+
+```{r bin-cal-plot, fig.height=5}
+cal_long <- bind_rows(lapply(names(sites), function(s) {
+  cbind(cal_curve(res[[s]]$preterm, res[[s]]$p_m3,
+                  grid = seq(0.01, 0.99, length.out = 100)),
+        site_lab = factor(sites[[s]], levels = sites))
+}))
+plot_bin_calibration(cal_long, max_p = 1) +
+  labs(title = "Flexible calibration curves, full model",
+       subtitle = "Most infants have predicted risk near 0; see the histogram below")
+```
+
+```{r risk-hist, fig.height=3}
+bind_rows(lapply(names(sites), function(s) {
+  data.frame(p = res[[s]]$p_m3, site_lab = factor(sites[[s]], levels = sites))
+})) |>
+  ggplot(aes(p, fill = site_lab)) +
+  geom_histogram(binwidth = 0.05, boundary = 0, colour = "white") +
+  facet_wrap(~ site_lab, scales = "free_y") +
+  scale_fill_manual(values = COL_SITE, guide = "none") +
+  labs(x = "Predicted risk of preterm birth", y = "Infants") +
+  theme_seminar()
+```
+
+* **Site A** has almost the same AUC as the development test set, but it
+  **over-predicts** preterm risk (O/E < 1). The lab shift pushes GA predictions
+  down, so preterm risk goes up. The AUC cannot see this.
+* **Site B** appears to **under-predict** (O/E > 1), with a calibration slope
+  well below 1, which would usually suggest overfitting. Here it is mostly the
+  noisy reference standard: late ultrasounds misclassify some term infants as
+  preterm, and the model is "penalised" for correctly calling them term. Check
+  it against the true status:
+
+```{r siteB-true}
+bin_metrics(res$siteB$preterm_true, res$siteB$p_m3) |>
+  select(prevalence, mean_pred, O_E, CITL, cal_slope, AUC) |>
+  mutate(across(everything(), \(x) round(x, 3)))
+```
+
+Against the true status, calibration-in-the-large is close to ideal. The slope
+is now **above** 1, so the risks are if anything too cautious, because the
+model also learned from an imperfect reference in development.
+
+## Overfitting shows up as a calibration slope below 1
+
+```{r overfit}
+n_pred <- ncol(make_x(res$test[1:2, ], res$models$spec))
+ovf <- bind_rows(
+  cbind(model = "Full (elastic net, n = 40,000)",
+        cont_metrics(res$test$ga_ref, res$test$pred_m3)),
+  cbind(model = paste0("Small-n OLS (n = 200, ", n_pred, " predictors)"),
+        cont_metrics(res$test$ga_ref, res$test$pred_small)),
+  cbind(model = "Random forest",
+        cont_metrics(res$test$ga_ref, res$test$pred_rf)))
+ovf |> select(model, MAE_wk, within_7d, cal_slope) |>
+  mutate(across(where(is.double), \(x) round(x, 2)))
+```
+
+* **Slope < 1** (small-n OLS): predictions are **too extreme**, the classic
+  sign of overfitting.
+* **Slope > 1** (random forest): predictions are **too compressed** toward the
+  mean. Forests cannot extrapolate beyond the averages of their leaves.
+
+Neither shows up in the MAE alone.
+
+# Clinical usefulness: net benefit
+
+Suppose the model is used to flag infants as **preterm for extra follow-up**.
+The threshold probability *p*~t~ expresses how many false positives you would
+accept per true positive: *p*~t~ = 0.2 means flagging 4 term infants to catch
+1 preterm infant is acceptable.
+
+> **Net benefit** = TP/*n* − FP/*n* × *p*~t~ / (1 − *p*~t~)
+
+```{r dca, fig.height=4.5}
+dca_long <- function(d) {
+  nb3 <- net_benefit(d$preterm, d$p_m3)
+  nb1 <- net_benefit(d$preterm, d$p_m1)
+  bind_rows(
+    data.frame(threshold = nb3$threshold, net_benefit = nb3$model,
+               strategy = "Full (clinical + analytes)"),
+    data.frame(threshold = nb1$threshold, net_benefit = nb1$model,
+               strategy = "Clinical only"),
+    data.frame(threshold = nb3$threshold, net_benefit = nb3$treat_all,
+               strategy = "Treat all"),
+    data.frame(threshold = nb3$threshold, net_benefit = 0,
+               strategy = "Treat none"))
+}
+dca_both <- bind_rows(
+  cbind(dca_long(res$test),  site_lab = "Development (test)"),
+  cbind(dca_long(res$siteA), site_lab = "External site A"))
+plot_dca(dca_both) + facet_wrap(~ site_lab) +
+  labs(title = "Decision curves: flagging preterm infants")
+```
+
+A model is useful at a given threshold if its curve sits above **both** "treat
+all" and "treat none". The full model adds net benefit over the clinical model
+across the plausible range of thresholds, in both settings.
+
+# Class imbalance: should we upweight preterm infants?
+
+Preterm birth is uncommon (about 8% here), so a model fitted by least squares
+spends most of its effort on term infants. In the original metabolic GA models,
+preterm infants were **upweighted during training** with a graded weight:
+
+> *w* = 1 if GA ≥ 37 weeks; *w* = 1 + (37 − GA) / 1.5 if GA < 37 weeks
+
+so an infant born at 34 weeks counts 3 times, and at 28 weeks 7 times. A common
+alternative for binary outcomes is **balanced** weighting: each preterm infant
+counts (1 − prevalence) / prevalence ≈ 11 times. What do these choices do to
+each metric?
+
+```{r weights-fit}
+if (file.exists("output/weights.rds")) {
+  wfit <- readRDS("output/weights.rds")
+} else {
+  wfit <- fit_weighted(res)
+  saveRDS(wfit, "output/weights.rds")
+}
+add_weighted_preds <- function(d) {
+  x <- make_x(d, res$models$spec)
+  pr <- function(f) drop(predict(f, newx = x, s = "lambda.min",
+                                 type = "response"))
+  d$pred_wt     <- pr(wfit$cont_graded)   # continuous GA, graded weights
+  d$pbin_unw    <- pr(wfit$bin_unw)       # direct preterm models
+  d$pbin_graded <- pr(wfit$bin_graded)
+  d$pbin_bal    <- pr(wfit$bin_bal)
+  d
+}
+for (s in c("test", "siteA")) res[[s]] <- add_weighted_preds(res[[s]])
+```
+
+## Continuous GA: a trade-off between preterm and term accuracy
+
+```{r weights-cont}
+ga_band <- function(ga) cut(ga, c(0, 32, 34, 37, 39, 41, 50), right = FALSE,
+                            labels = c("<32", "32-33", "34-36", "37-38",
+                                       "39-40", "41+"))
+res$test |>
+  group_by(`Reference GA` = ga_band(ga_ref)) |>
+  summarise(n = n(),
+            `MAE unweighted` = mean(abs(pred_m3 - ga_ref)),
+            `MAE weighted`   = mean(abs(pred_wt - ga_ref)),
+            `Bias unweighted` = mean(pred_m3 - ga_ref),
+            `Bias weighted`   = mean(pred_wt - ga_ref)) |>
+  mutate(across(where(is.double), \(x) round(x, 2)))
+```
+
+```{r weights-overall}
+d <- res$test
+flag <- function(p) c(sensitivity = mean(p[d$preterm == 1] < 37),
+                      PPV = mean(d$preterm[p < 37]))
+bind_rows(
+  cbind(model = "Unweighted", cont_metrics(d$ga_ref, d$pred_m3),
+        t(flag(d$pred_m3))),
+  cbind(model = "Graded preterm weights", cont_metrics(d$ga_ref, d$pred_wt),
+        t(flag(d$pred_wt)))) |>
+  select(model, MAE_wk, within_7d, cal_slope, sensitivity, PPV) |>
+  mutate(across(where(is.double), \(x) round(x, 3)))
+```
+
+Here *sensitivity* and *PPV* treat "predicted GA < 37 weeks" as a positive
+test.
+
+```{r weights-bias-plot, fig.height=4.2}
+plot_weighting_bias(res$test, c("Unweighted" = "pred_m3",
+                                "Graded preterm weights" = "pred_wt")) +
+  labs(title = "What weighting does to the errors (development test set)")
+```
+
+* Weighting **shrinks the regression-to-the-mean bias** in preterm infants
+  and improves their MAE, at a small cost for term infants. Overall MAE barely
+  moves.
+* Seen conditional on the prediction (right), the weighted model **pulls
+  predictions near 37–38 weeks downward**. Infants predicted to be 37–38 weeks
+  are, on average, older than predicted. More infants cross the < 37 line:
+  sensitivity rises and PPV falls.
+* The unweighted model was itself slightly miscalibrated in the sparse
+  preterm range (right panel, 31–35 weeks). Weighting makes the model attend
+  to that region and repairs most of it, while creating a smaller distortion
+  just below term. This is a legitimate **choice of
+  loss function** ("errors in preterm infants matter more"), and it should be
+  reported as one.
+
+## Binary preterm models: weighting moves the threshold, not the ranking
+
+```{r weights-bin}
+bin_row <- function(label, p) {
+  cbind(model = label,
+        bin_metrics(d$preterm, p)[, c("AUC", "O_E", "CITL", "cal_slope")],
+        class_metrics(d$preterm, p, 0.5)[, c("sensitivity", "specificity",
+                                             "PPV")])
+}
+d <- res$test
+bind_rows(bin_row("Unweighted", d$pbin_unw),
+          bin_row("Graded preterm weights", d$pbin_graded),
+          bin_row("Balanced weights (x11)", d$pbin_bal)) |>
+  mutate(across(where(is.double), \(x) round(x, 3)))
+```
+
+The AUC is **identical**: weighting adds no information about who is preterm.
+What changes is the **risk scale**. Balanced weighting roughly doubles every
+predicted risk (O/E ≈ 0.5, CITL ≈ −log 11), so a "0.5" cut-off now behaves
+like a much lower threshold. The same result comes from simply moving the
+threshold on the unweighted model:
+
+```{r weights-equiv}
+w <- wfit$w_bal
+rbind(
+  cbind(model = "Balanced weights, threshold 0.5",
+        class_metrics(d$preterm, d$pbin_bal, 0.5)),
+  cbind(model = sprintf("Unweighted, threshold 1/(1+%.0f)", w),
+        class_metrics(d$preterm, d$pbin_unw, 1 / (1 + w)))) |>
+  select(model, sensitivity, specificity, PPV, NPV) |>
+  mutate(across(where(is.double), \(x) round(x, 3)))
+
+# ...and subtracting log(w) on the logit scale undoes the miscalibration
+p_corr <- plogis(qlogis(clamp(d$pbin_bal)) - log(w))
+bin_metrics(d$preterm, p_corr)[, c("O_E", "CITL", "cal_slope", "AUC")] |>
+  round(3)
+```
+
+```{r weights-dca, fig.height=4.2}
+wt_models <- c("Unweighted" = "pbin_unw",
+               "Graded preterm weights" = "pbin_graded",
+               "Balanced weights (x11)" = "pbin_bal")
+nb_w <- bind_rows(lapply(names(wt_models), function(m) {
+  nb <- net_benefit(d$preterm, d[[wt_models[[m]]]])
+  data.frame(strategy = m, threshold = nb$threshold, net_benefit = nb$model,
+             treat_all = nb$treat_all)
+}))
+nb_w$strategy <- factor(nb_w$strategy, levels = names(wt_models))
+ggplot(nb_w, aes(threshold, net_benefit, colour = strategy,
+                 linetype = strategy)) +
+  geom_line(data = subset(nb_w, strategy == "Unweighted"),
+            aes(threshold, treat_all), inherit.aes = FALSE,
+            colour = INK2, linetype = "dotted", linewidth = 0.6) +
+  geom_hline(yintercept = 0, colour = INK, linetype = "dotted",
+             linewidth = 0.4) +
+  geom_line(linewidth = 0.9) +
+  scale_colour_manual(values = COL_WT) +
+  scale_linetype_manual(values = LTY_WT) +
+  coord_cartesian(ylim = c(-0.01, 0.08)) +
+  labs(title = "Net benefit when predicted risks are taken at face value",
+       subtitle = "Dotted grey = treat all; dotted black = treat none",
+       x = "Threshold probability", y = "Net benefit") +
+  theme_seminar()
+```
+
+If the weighted model's risks are used as if they were real probabilities,
+it shows **lower net benefit at every threshold**. The model is no worse at
+ranking; its risks are simply inflated, so each threshold flags too many
+infants.
+
+::: {.callout-tip}
+## Take-away on class imbalance
+* Rare outcomes do not need to be "fixed" to get a good AUC or good
+  calibration.
+* If the concern is missing preterm infants, **choose the decision threshold**
+  (for example with a decision curve) rather than reweighting the data.
+* If you do weight, for example as a deliberate loss-function choice for
+  continuous GA, **report calibration** and recalibrate risks before they are
+  used for decisions.
+* See van den Goorbergh et al., *JAMIA* 2022, on the harms of
+  class-imbalance corrections for risk prediction.
+:::
+
+# Internal and external validation
+
+## How optimistic is apparent performance?
+
+Take the small-n model. Its **apparent** performance, measured in the same 200
+infants it was fitted on, looks excellent. Bootstrap optimism correction
+estimates how much of that will disappear, using only the development data:
+
+```{r bootstrap}
+dev_small <- res$train[res$models$small_rows, ]
+X  <- cbind(1, make_x(dev_small, res$models$spec))
+y  <- dev_small$ga_ref
+fit_ols <- function(X, y) { b <- lm.fit(X, y)$coefficients; b[is.na(b)] <- 0; b }
+perf <- function(y, p) c(MAE = mean(abs(y - p)), slope = unname(coef(lm(y ~ p))[2]))
+
+apparent <- perf(y, X %*% fit_ols(X, y))
+set.seed(42)
+optimism <- rowMeans(replicate(200, {
+  i <- sample(nrow(X), replace = TRUE)
+  b <- fit_ols(X[i, ], y[i])
+  perf(y[i], X[i, ] %*% b) - perf(y, X %*% b)   # boot-apparent - boot-on-original
+}))
+data.frame(
+  estimate = c("Apparent (n = 200)", "Bootstrap optimism-corrected",
+               "Actual, independent test set (n = 20,000)"),
+  rbind(apparent, apparent - optimism,
+        perf(res$test$ga_ref, res$test$pred_small)),
+  row.names = NULL) |>
+  mutate(across(where(is.double), \(x) round(x, 2)))
+```
+
+Apparent performance is badly optimistic. The bootstrap-corrected estimate is
+much closer to the truth, using only the 200 development infants, which
+matters most when data are scarce. Here it slightly **over**-corrects: with
+67 predictors and 200 infants, no internal validation is precise. The real
+lesson is that this model should not have been fitted this way in the first
+place (see sample-size guidance for model development, e.g. Riley et al.).
+
+## Updating a model for a new setting
+
+At site A the model is well ranked but shifted. Use **half** of site A to
+re-estimate the intercept (and slope), then evaluate in the **other half**:
+
+```{r recal}
+set.seed(7)
+iA <- sample(nrow(res$siteA), nrow(res$siteA) / 2)
+upd <- res$siteA[iA, ]; evl <- res$siteA[-iA, ]
+
+f_int   <- recal_continuous(upd$ga_ref, upd$pred_m3, slope = FALSE)
+f_slope <- recal_continuous(upd$ga_ref, upd$pred_m3, slope = TRUE)
+evl$pred_int   <- f_int(evl$pred_m3)
+evl$pred_slope <- f_slope(evl$pred_m3)
+
+# preterm risk follows from the updated GA predictions through the same link
+risk <- function(pred) predict(link, newdata = data.frame(pred_m3 = pred),
+                               type = "response")
+
+version_row <- function(label, pred) {
+  cbind(version = label, cont_metrics(evl$ga_ref, pred),
+        bin_metrics(evl$preterm, risk(pred))[, c("O_E", "CITL", "AUC")])
+}
+bind_rows(version_row("Original", evl$pred_m3),
+          version_row("Intercept updated", evl$pred_int),
+          version_row("Intercept + slope updated", evl$pred_slope)) |>
+  select(version, bias_wk, MAE_wk, within_7d, O_E, CITL, AUC) |>
+  mutate(across(where(is.double), \(x) round(x, 3)))
+```
+
+A simple intercept update, estimated from 750 local infants, removes the bias
+and most of the risk miscalibration. Adding a slope gains little here, because
+the slope was already close to 1. The AUC does not change: shifting every
+prediction by the same amount does not change the ranking.
+
+# Take-home checklist
+
+1. **What is the model for?** The intended use decides which metrics matter.
+2. **Report discrimination and calibration**, never the AUC alone.
+3. **Calibration is judged conditional on the prediction.** Subgroup bias by
+   true outcome is a different question.
+4. **Check clinical usefulness** (net benefit) at thresholds that make sense.
+5. **Internal validation** (bootstrap, cross-validation) estimates optimism.
+   **External validation** tests transportability, which is a different
+   question.
+6. **Interrogate the reference standard** before blaming the model.
+7. Poor calibration in a new setting is often **fixable** by updating.
+8. **Class imbalance** is handled by choosing thresholds, not by distorting
+   risks. If you weight, report and correct calibration.
+9. Report with **TRIPOD+AI** and appraise with **PROBAST+AI**.
+
+# References and further reading
+
+* Hawken S, et al. Development and external validation of machine learning
+  algorithms for postnatal gestational age estimation using clinical data and
+  metabolomic markers. *PLOS ONE* 2023.
+* Hawken S, et al. External validation of machine learning models including
+  newborn metabolomic markers for postnatal gestational age estimation in East
+  and South-East Asian infants. *Gates Open Res* 2021.
+* Hawken S, et al. Real world external validation of metabolic gestational age
+  assessment in Kenya. *PLOS Glob Public Health* 2022.
+* Murphy MSQ, et al. External validation of postnatal gestational age
+  estimation using newborn metabolic profiles in Matlab, Bangladesh. *eLife*
+  2019.
+* Van Calster B, et al. Calibration: the Achilles heel of predictive
+  analytics. *BMC Med* 2019.
+* van den Goorbergh R, van Smeden M, Timmerman D, Van Calster B. The harm of
+  class imbalance corrections for risk prediction models: illustration and
+  simulation using logistic regression. *J Am Med Inform Assoc* 2022.
+* Vickers AJ, Elkin EB. Decision curve analysis: a novel method for evaluating
+  prediction models. *Med Decis Making* 2006.
+* Riley RD, Archer L, et al. Evaluation of clinical prediction models (parts
+  1–3). *BMJ* 2024.
+* Collins GS, et al. TRIPOD+AI statement. *BMJ* 2024.
+
+```{r session}
+sessionInfo()
+```
