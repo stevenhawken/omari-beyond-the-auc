@@ -92,7 +92,9 @@ We split the development cohort 2/3 for training and 1/3 for testing, then fit:
 dir.create("output", showWarnings = FALSE)   # model cache (not stored in the repository)
 if (file.exists("output/fit.rds")) {
   res <- readRDS("output/fit.rds")
-} else {
+}
+# refit if there is no cache, or the cache was made before {ranger} was installed
+if (!exists("res") || (is.null(res$models$rf) && requireNamespace("ranger", quietly = TRUE))) {
   res <- fit_all(dev, siteA, siteB)
   saveRDS(res, "output/fit.rds")
 }
@@ -392,8 +394,9 @@ ovf <- bind_rows(
         cont_metrics(res$test$ga_ref, res$test$pred_m3)),
   cbind(model = paste0("Small-n OLS (n = 200, ", n_pred, " predictors)"),
         cont_metrics(res$test$ga_ref, res$test$pred_small)),
-  cbind(model = "Random forest",
-        cont_metrics(res$test$ga_ref, res$test$pred_rf)))
+  if (!is.null(res$test$pred_rf))      # needs {ranger}; skipped if not installed
+    cbind(model = "Random forest",
+          cont_metrics(res$test$ga_ref, res$test$pred_rf)))
 ovf |> select(model, MAE_wk, within_7d, cal_slope) |>
   mutate(across(where(is.double), \(x) round(x, 2)))
 ```
